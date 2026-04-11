@@ -6,6 +6,7 @@ import (
 	"html/template"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -13,8 +14,27 @@ import (
 func (s *Service) ServeBoardWeb(cwd string, port int) error {
 	mux := http.NewServeMux()
 
+	// effectiveCwd returns the cwd to use for this request. Reads the
+	// forge_project cookie; if valid, resolves to the project's first repo
+	// path. Otherwise falls back to the startup cwd.
+	effectiveCwd := func(r *http.Request) string {
+		c, err := r.Cookie("forge_project")
+		if err != nil || c.Value == "" {
+			return cwd
+		}
+		parts := strings.SplitN(c.Value, "/", 2)
+		if len(parts) != 2 {
+			return cwd
+		}
+		path, err := s.CwdForProject(parts[0], parts[1])
+		if err != nil {
+			return cwd
+		}
+		return path
+	}
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		board, err := s.Board(cwd)
+		board, err := s.Board(effectiveCwd(r))
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
@@ -24,7 +44,7 @@ func (s *Service) ServeBoardWeb(cwd string, port int) error {
 	})
 
 	mux.HandleFunc("/api/board", func(w http.ResponseWriter, r *http.Request) {
-		board, err := s.Board(cwd)
+		board, err := s.Board(effectiveCwd(r))
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
@@ -34,7 +54,7 @@ func (s *Service) ServeBoardWeb(cwd string, port int) error {
 	})
 
 	mux.HandleFunc("/partials/board", func(w http.ResponseWriter, r *http.Request) {
-		board, err := s.Board(cwd)
+		board, err := s.Board(effectiveCwd(r))
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
@@ -49,7 +69,7 @@ func (s *Service) ServeBoardWeb(cwd string, port int) error {
 			http.Error(w, "missing spec file", 400)
 			return
 		}
-		detail, err := s.SpecDetail(cwd, specFile)
+		detail, err := s.SpecDetail(effectiveCwd(r), specFile)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
@@ -64,7 +84,7 @@ func (s *Service) ServeBoardWeb(cwd string, port int) error {
 			http.Error(w, "missing spec file", 400)
 			return
 		}
-		detail, err := s.SpecDetail(cwd, specFile)
+		detail, err := s.SpecDetail(effectiveCwd(r), specFile)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
@@ -79,7 +99,7 @@ func (s *Service) ServeBoardWeb(cwd string, port int) error {
 			http.Error(w, "missing run ID", 400)
 			return
 		}
-		events, err := s.LoadRunEvents(cwd, runID)
+		events, err := s.LoadRunEvents(effectiveCwd(r), runID)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
@@ -89,7 +109,7 @@ func (s *Service) ServeBoardWeb(cwd string, port int) error {
 	})
 
 	mux.HandleFunc("/api/feed", func(w http.ResponseWriter, r *http.Request) {
-		board, err := s.Board(cwd)
+		board, err := s.Board(effectiveCwd(r))
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
@@ -99,7 +119,7 @@ func (s *Service) ServeBoardWeb(cwd string, port int) error {
 	})
 
 	mux.HandleFunc("/api/inbox", func(w http.ResponseWriter, r *http.Request) {
-		board, err := s.Board(cwd)
+		board, err := s.Board(effectiveCwd(r))
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
@@ -109,13 +129,57 @@ func (s *Service) ServeBoardWeb(cwd string, port int) error {
 	})
 
 	mux.HandleFunc("/partials/sidebar", func(w http.ResponseWriter, r *http.Request) {
-		board, err := s.Board(cwd)
+		board, err := s.Board(effectiveCwd(r))
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_ = sidebarPartialTemplate.Execute(w, board)
+	})
+
+	// Project picker endpoints.
+	mux.HandleFunc("/api/projects", func(w http.ResponseWriter, r *http.Request) {
+		projects, err := s.ListAllProjects()
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(projects)
+	})
+
+	mux.HandleFunc("/project/select", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		var payload struct {
+			Workspace string `json:"workspace"`
+			ProjectID string `json:"projectId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "invalid payload", 400)
+			return
+		}
+		if payload.Workspace == "" || payload.ProjectID == "" {
+			http.Error(w, "missing workspace or projectId", 400)
+			return
+		}
+		// Validate the project exists and has a linked repo.
+		if _, err := s.CwdForProject(payload.Workspace, payload.ProjectID); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     "forge_project",
+			Value:    payload.Workspace + "/" + payload.ProjectID,
+			Path:     "/",
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+			MaxAge:   60 * 60 * 24 * 365, // 1 year
+		})
+		w.WriteHeader(http.StatusNoContent)
 	})
 
 	// SSE endpoint — pushes board state every 2s for real-time updates.
@@ -134,15 +198,17 @@ func (s *Service) ServeBoardWeb(cwd string, port int) error {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 
+		reqCwd := effectiveCwd(r)
+
 		// Send initial state immediately.
-		sendBoardSSE(w, flusher, s, cwd)
+		sendBoardSSE(w, flusher, s, reqCwd)
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				sendBoardSSE(w, flusher, s, cwd)
+				sendBoardSSE(w, flusher, s, reqCwd)
 			}
 		}
 	})
@@ -364,6 +430,12 @@ const boardFullHTML = `<!DOCTYPE html>
   </style>
 </head>
 <body class="min-h-screen font-sans antialiased">
+  <div id="project-picker-menu" class="hidden fixed z-50 bg-surface-1 border border-border-medium rounded-lg shadow-2xl min-w-[260px] max-h-[400px] overflow-y-auto">
+    <div class="px-3 py-2 text-[11px] font-mono text-txt-tertiary uppercase tracking-wider border-b border-border-subtle">Projects</div>
+    <div id="project-picker-list" class="py-1">
+      <div class="px-3 py-2 text-[12px] text-txt-tertiary">Loading...</div>
+    </div>
+  </div>
   <div id="board-content" hx-get="/partials/board" hx-trigger="every 5s" hx-swap="innerHTML">
 ` + boardPartialHTML + `
   </div>
@@ -417,6 +489,82 @@ const boardFullHTML = `<!DOCTYPE html>
     }
 
     connectSSE();
+  })();
+
+  // Project picker dropdown — fetches /api/projects, renders the list,
+  // and posts the selection to /project/select before reloading.
+  (function() {
+    function openPicker() {
+      var btn = document.getElementById('project-picker-btn');
+      var menu = document.getElementById('project-picker-menu');
+      if (!btn || !menu) return;
+
+      var rect = btn.getBoundingClientRect();
+      menu.style.top = (rect.bottom + 6) + 'px';
+      menu.style.left = rect.left + 'px';
+      menu.classList.remove('hidden');
+
+      fetch('/api/projects').then(function(r) { return r.json(); }).then(function(projects) {
+        var list = document.getElementById('project-picker-list');
+        if (!projects || projects.length === 0) {
+          list.innerHTML = '<div class="px-3 py-2 text-[12px] text-txt-tertiary">No projects found</div>';
+          return;
+        }
+        var byWorkspace = {};
+        projects.forEach(function(p) {
+          if (!byWorkspace[p.workspace]) byWorkspace[p.workspace] = [];
+          byWorkspace[p.workspace].push(p);
+        });
+        var html = '';
+        Object.keys(byWorkspace).sort().forEach(function(ws) {
+          html += '<div class="px-3 pt-2 pb-1 text-[10px] font-mono text-txt-tertiary uppercase">' + ws + '</div>';
+          byWorkspace[ws].forEach(function(p) {
+            html += '<button class="project-item w-full text-left px-3 py-2 text-[13px] text-txt-primary hover:bg-surface-2 transition-colors flex items-center gap-2" data-ws="' + p.workspace + '" data-id="' + p.projectId + '">';
+            html += '<span class="flex-1 truncate">' + p.projectName + '</span>';
+            html += '<span class="text-[10px] font-mono text-txt-tertiary">' + p.projectId + '</span>';
+            html += '</button>';
+          });
+        });
+        list.innerHTML = html;
+        list.querySelectorAll('.project-item').forEach(function(btn) {
+          btn.addEventListener('click', function() {
+            var ws = btn.getAttribute('data-ws');
+            var id = btn.getAttribute('data-id');
+            fetch('/project/select', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ workspace: ws, projectId: id })
+            }).then(function(r) {
+              if (r.ok) { window.location.reload(); }
+              else { r.text().then(function(t) { alert('Failed to switch project: ' + t); }); }
+            });
+          });
+        });
+      });
+    }
+
+    function closePicker() {
+      var menu = document.getElementById('project-picker-menu');
+      if (menu) menu.classList.add('hidden');
+    }
+
+    document.addEventListener('click', function(e) {
+      var btn = e.target.closest('#project-picker-btn');
+      var menu = document.getElementById('project-picker-menu');
+      if (btn) {
+        e.stopPropagation();
+        if (menu && !menu.classList.contains('hidden')) closePicker();
+        else openPicker();
+        return;
+      }
+      if (menu && !menu.classList.contains('hidden') && !e.target.closest('#project-picker-menu')) {
+        closePicker();
+      }
+    });
+
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') closePicker();
+    });
   })();
 
   // Keyboard shortcuts for rapid operator navigation.
@@ -571,7 +719,13 @@ const boardPartialHTML = `
         <path d="M6 10h8M10 6v8" stroke="white" stroke-width="1.5" stroke-linecap="round"/>
       </svg>
       <span class="text-[15px] font-semibold tracking-tight">Forge</span>
-      {{if .ProjectName}}<span class="text-txt-tertiary mx-1">/</span><span class="text-[15px] text-txt-secondary">{{.ProjectName}}</span>{{end}}
+      {{if .ProjectName}}
+      <span class="text-txt-tertiary mx-1">/</span>
+      <button id="project-picker-btn" class="text-[15px] text-txt-secondary hover:text-txt-primary transition-colors flex items-center gap-1 cursor-pointer">
+        <span>{{.ProjectName}}</span>
+        <svg width="10" height="10" viewBox="0 0 10 10" class="text-txt-tertiary"><path d="M2 4l3 3 3-3" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      {{end}}
     </div>
     <div class="flex items-center gap-6">
       {{if .Inbox}}<div class="flex items-center gap-1.5 text-[12px] font-mono px-2.5 py-1 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20">
