@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/chalfel/forge-flow/internal/forge"
+	"github.com/chalfel/forge-flow/internal/forge/cloud"
 	"github.com/charmbracelet/huh"
 )
 
@@ -58,6 +59,10 @@ func main() {
 		handleContext(svc, os.Args[2:])
 	case "dev":
 		handleDev(svc, os.Args[2:])
+	case "cloud":
+		handleCloud(svc, os.Args[2:])
+	case "login":
+		handleCloud(svc, []string{"login"})
 	case "pi":
 		handlePI(svc, os.Args[2:])
 	case "help", "-h", "--help":
@@ -1565,6 +1570,180 @@ func handlePI(svc *forge.Service, args []string) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Cloud commands
+// ---------------------------------------------------------------------------
+
+func handleCloud(_ *forge.Service, args []string) {
+	if len(args) == 0 {
+		handleCloudStatus()
+		return
+	}
+	switch args[0] {
+	case "login":
+		handleCloudLogin(args[1:])
+	case "logout":
+		handleCloudLogout()
+	case "status":
+		handleCloudStatus()
+	case "tasks":
+		handleCloudTasks(args[1:])
+	case "sync":
+		handleCloudSync(args[1:])
+	case "help", "-h", "--help":
+		fmt.Print(`forge cloud — Forge Cloud integration
+
+Usage:
+  forge cloud login             Authenticate with Forge Cloud
+  forge cloud logout            Clear stored credentials
+  forge cloud status            Show connection status
+  forge cloud tasks [--json]    List assigned tasks
+  forge cloud sync              Sync local state with cloud
+`)
+	default:
+		fatal(fmt.Errorf("unknown cloud subcommand: %s", args[0]))
+	}
+}
+
+func handleCloudLogin(args []string) {
+	fs := flag.NewFlagSet("forge cloud login", flag.ExitOnError)
+	cloudURL := fs.String("url", cloud.DefaultCloudURL, "Forge Cloud API URL")
+	_ = fs.Parse(args)
+
+	cfg := cloud.DefaultConfig()
+	cfg.CloudURL = *cloudURL
+
+	client := cloud.NewClient(cfg)
+
+	fmt.Println("Initiating login...")
+	deviceCode, err := client.LoginWithDeviceCode()
+	if err != nil {
+		fatal(err)
+	}
+
+	fmt.Printf("\nVisit: %s\n", deviceCode.VerificationURL)
+	fmt.Printf("Enter code: %s\n\n", deviceCode.UserCode)
+	fmt.Println("Waiting for authentication...")
+
+	creds, err := client.PollForToken(deviceCode.DeviceCode, deviceCode.Interval)
+	if err != nil {
+		fatal(err)
+	}
+
+	if err := cloud.SaveCredentials(*creds); err != nil {
+		fatal(fmt.Errorf("saving credentials: %w", err))
+	}
+
+	fmt.Printf("\nLogged in as %s\n", creds.Email)
+}
+
+func handleCloudLogout() {
+	if err := cloud.ClearCredentials(); err != nil {
+		fatal(err)
+	}
+	fmt.Println("Logged out.")
+}
+
+func handleCloudStatus() {
+	creds, err := cloud.LoadCredentials()
+	if err != nil {
+		fmt.Println("Not logged in.")
+		fmt.Println("Run: forge cloud login")
+		return
+	}
+
+	fmt.Printf("Logged in as: %s\n", creds.Email)
+	fmt.Printf("User ID: %s\n", creds.UserID)
+	if creds.TeamID != "" {
+		fmt.Printf("Team: %s\n", creds.TeamID)
+	}
+	fmt.Printf("Cloud URL: %s\n", creds.CloudURL)
+
+	if creds.IsExpired() {
+		fmt.Println("Token: expired (will refresh on next request)")
+	} else if creds.NeedsRefresh() {
+		fmt.Println("Token: expiring soon")
+	} else {
+		fmt.Println("Token: valid")
+	}
+}
+
+func handleCloudTasks(args []string) {
+	fs := flag.NewFlagSet("forge cloud tasks", flag.ExitOnError)
+	asJSON := fs.Bool("json", false, "output JSON")
+	_ = fs.Parse(args)
+
+	client, err := cloud.NewClientFromStored()
+	if err != nil {
+		fatal(err)
+	}
+
+	tasks, err := client.ListAssignedTasks()
+	if err != nil {
+		fatal(err)
+	}
+
+	if *asJSON {
+		printJSON(tasks)
+		return
+	}
+
+	if len(tasks) == 0 {
+		fmt.Println("No tasks assigned to you.")
+		return
+	}
+
+	fmt.Printf("Assigned tasks (%d):\n\n", len(tasks))
+	for _, t := range tasks {
+		fmt.Printf("  [%s] %s\n", t.Status, t.Name)
+		if t.Repo != "" {
+			fmt.Printf("         repo: %s\n", t.Repo)
+		}
+		if t.Branch != "" {
+			fmt.Printf("         branch: %s\n", t.Branch)
+		}
+	}
+}
+
+func handleCloudSync(args []string) {
+	fs := flag.NewFlagSet("forge cloud sync", flag.ExitOnError)
+	projectID := fs.String("project", "", "project ID to sync")
+	_ = fs.Parse(args)
+
+	client, err := cloud.NewClientFromStored()
+	if err != nil {
+		fatal(err)
+	}
+
+	fmt.Println("Syncing with Forge Cloud...")
+
+	// Create syncer
+	syncer := cloud.NewSyncer(client, *projectID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := syncer.Start(ctx); err != nil {
+		fatal(err)
+	}
+	defer syncer.Stop()
+
+	// Get synced state
+	state := syncer.State()
+	tasks := state.GetAssignedTasks()
+
+	fmt.Printf("Synced %d assigned tasks.\n", len(tasks))
+
+	if *projectID != "" {
+		kb := state.GetKnowledge(*projectID)
+		if kb != nil {
+			fmt.Println("Knowledge base synced.")
+		}
+	}
+
+	fmt.Println("Done.")
+}
+
 func printResult(asJSON bool, value any, human string) {
 	if asJSON {
 		printJSON(value)
@@ -1623,6 +1802,11 @@ Commands:
   forge dev edit         <project>
   forge dev detect       [--name NAME] [PATH]
   forge dev all          Start all configured projects
+  forge cloud login      Authenticate with Forge Cloud
+  forge cloud logout     Clear stored credentials
+  forge cloud status     Show connection status
+  forge cloud tasks      [--json]                          (list assigned tasks)
+  forge cloud sync       [--project ID]                    (sync local state with cloud)
   forge mcp serve        (reads JSON-RPC from stdin, writes to stdout; for MCP-compatible hosts)
   forge context resolve  [--cwd PATH]
   forge pi install       [--package-path PATH]
