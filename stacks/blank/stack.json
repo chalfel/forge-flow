@@ -1,0 +1,22 @@
+{
+  "id": "blank",
+  "name": "Blank",
+  "description": "A minimal Forge project with shared KB/spec structure and no opinionated app stack.",
+  "defaultTopology": "single-repo",
+  "supportedTopologies": ["single-repo", "monorepo", "multi-repo"],
+  "rootRepo": {
+    "repoId": "app",
+    "repoNameTemplate": "{{projectId}}",
+    "role": "primary application repo"
+  },
+  "qualityExpectations": [
+    "Capture the first capability as a Forge spec before implementing it.",
+    "Use forge test setup once the first behavior-driven spec exists.",
+    "Document architecture and business constraints in the shared kb/ before parallelizing work."
+  ],
+  "starterSteps": [
+    "Review kb/architecture.md and kb/business.md before writing the first spec.",
+    "Use forge project add when new surfaces appear."
+  ],
+  "components": []
+}
