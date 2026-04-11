@@ -256,11 +256,15 @@ func (s *Service) ServeBoardWeb(cwd string, port int) error {
 
 	fmt.Printf("Forge Board running at http://%s\n", addr)
 
-	// Wrap handler to disable WriteTimeout for SSE connections, which are
-	// long-lived and would be killed by the default 10s write timeout.
+	// Wrap handler to disable WriteTimeout for long-lived endpoints. SSE is
+	// streaming indefinitely; /api/analyze shells out to the claude CLI which
+	// commonly takes 15-30s, longer than the default 10s write timeout.
+	longLived := map[string]bool{
+		"/events/stream": true,
+		"/api/analyze":   true,
+	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/events/stream" {
-			// For SSE, disable the write deadline so the connection stays open.
+		if longLived[r.URL.Path] {
 			if rc := http.NewResponseController(w); rc != nil {
 				_ = rc.SetWriteDeadline(time.Time{})
 			}
