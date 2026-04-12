@@ -133,6 +133,12 @@ func (d *Daemon) OnTaskAssigned(task CloudTask, spec CloudSpec) {
 	if d.onTaskAssigned != nil {
 		d.onTaskAssigned(task, spec)
 	}
+
+	// Desktop notification
+	if ShouldNotify("task_assigned") {
+		NotifyTaskAssigned(task.Name, spec.Title)
+	}
+
 	// Write notification to local file for CLI to pick up
 	d.writeNotification("task_assigned", map[string]any{
 		"task": task,
@@ -156,10 +162,20 @@ func (d *Daemon) OnKnowledgeUpdated(projectID, section, content string) {
 
 func (d *Daemon) OnConnectionChange(connected bool) {
 	d.mu.Lock()
+	wasConnected := d.lastPing.After(time.Time{})
 	if connected {
 		d.lastPing = time.Now()
 	}
 	d.mu.Unlock()
+
+	// Notify on connection state changes
+	if ShouldNotify("connection") {
+		if connected && !wasConnected {
+			NotifyConnectionRestored()
+		} else if !connected && wasConnected {
+			NotifyConnectionLost()
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------

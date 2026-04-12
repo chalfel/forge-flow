@@ -1865,6 +1865,8 @@ func handleCloud(_ *forge.Service, args []string) {
 		handleCloudTasks(args[1:])
 	case "sync":
 		handleCloudSync(args[1:])
+	case "notify":
+		handleCloudNotify(args[1:])
 	case "help", "-h", "--help":
 		fmt.Print(`forge cloud — Forge Cloud integration
 
@@ -1874,10 +1876,44 @@ Usage:
   forge cloud status            Show connection status
   forge cloud tasks [--json]    List assigned tasks
   forge cloud sync              Sync local state with cloud
+  forge cloud notify [--test]   Test/configure notifications
 `)
 	default:
 		fatal(fmt.Errorf("unknown cloud subcommand: %s", args[0]))
 	}
+}
+
+func handleCloudNotify(args []string) {
+	fs := flag.NewFlagSet("forge cloud notify", flag.ExitOnError)
+	test := fs.Bool("test", false, "send a test notification")
+	_ = fs.Parse(args)
+
+	if *test {
+		fmt.Println("Sending test notification...")
+		err := cloud.Notify(cloud.Notification{
+			Title:   "Forge Test",
+			Message: "Notifications are working!",
+			Level:   cloud.NotifySuccess,
+			Sound:   true,
+		})
+		if err != nil {
+			fatal(err)
+		}
+		fmt.Println("Test notification sent.")
+		return
+	}
+
+	// Show current notification preferences
+	prefs := cloud.GetNotificationPrefs()
+	fmt.Println("Notification settings:")
+	fmt.Printf("  Enabled:          %v\n", prefs.Enabled)
+	fmt.Printf("  Desktop:          %v\n", prefs.Desktop)
+	fmt.Printf("  Sound:            %v\n", prefs.Sound)
+	fmt.Printf("  Task assigned:    %v\n", prefs.TaskAssigned)
+	fmt.Printf("  Task completed:   %v\n", prefs.TaskCompleted)
+	fmt.Printf("  Review feedback:  %v\n", prefs.ReviewFeedback)
+	fmt.Printf("  Connection:       %v\n", prefs.ConnectionEvents)
+	fmt.Println("\nTest: forge cloud notify --test")
 }
 
 func handleCloudLogin(args []string) {
