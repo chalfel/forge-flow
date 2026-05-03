@@ -25,8 +25,18 @@ type Workflow struct {
 	Agent        Agent        `yaml:"agent"`
 	Codex        AgentCommand `yaml:"codex"`
 	ClaudeCode   AgentCommand `yaml:"claude_code"`
+	Captain      Captain      `yaml:"captain"`
 	PromptBody   string       `yaml:"-"`
 	SourcePath   string       `yaml:"-"`
+}
+
+// Captain configures the planning agent that turns high-level demands into
+// a list of tickets. Defaults: agent kind = workflow.agent.kind; command =
+// AgentCommandFor's command; prompt = baked-in default.
+type Captain struct {
+	Command       string `yaml:"command"`
+	PromptPath    string `yaml:"prompt_path"`
+	TurnTimeoutMs int    `yaml:"turn_timeout_ms"`
 }
 
 type TrackerKind string

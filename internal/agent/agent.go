@@ -21,6 +21,10 @@ type RunResult struct {
 	Err          error
 	InputTokens  int
 	OutputTokens int
+	// Output is the captured stdout+stderr from the agent. The scheduler
+	// does not inspect this; the captain reads it to parse a JSON ticket
+	// plan from the agent's reply.
+	Output string
 }
 
 type Agent interface {

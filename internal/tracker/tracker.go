@@ -21,3 +21,11 @@ type Tracker interface {
 	// detect tracker-side state changes (terminal moves, manual retry).
 	GetIssue(ctx context.Context, id string) (*domain.Issue, error)
 }
+
+// Writer is an optional capability: trackers that implement it accept
+// captain-authored issue drafts. Adapters that do not (e.g. the read-only
+// stub) simply omit this interface and the captain returns an error when the
+// configured tracker is not a Writer.
+type Writer interface {
+	CreateIssue(ctx context.Context, draft domain.IssueDraft) (*domain.Issue, error)
+}

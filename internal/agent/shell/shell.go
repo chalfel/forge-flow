@@ -86,13 +86,14 @@ func (r *Runner) Run(ctx context.Context, req agent.RunRequest) agent.RunResult 
 	err := cmd.Run()
 	elapsed := time.Since(start)
 
+	output := combined.String()
 	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 		r.log.Warn("agent turn timed out",
 			"issue", req.Issue.Identifier,
 			"elapsed_ms", elapsed.Milliseconds(),
 			"output", truncate(combined.Bytes()),
 		)
-		return agent.RunResult{Status: domain.StatusTimedOut, Err: fmt.Errorf("turn timeout after %s", r.turnTimeout)}
+		return agent.RunResult{Status: domain.StatusTimedOut, Err: fmt.Errorf("turn timeout after %s", r.turnTimeout), Output: output}
 	}
 
 	if err != nil {
@@ -102,14 +103,14 @@ func (r *Runner) Run(ctx context.Context, req agent.RunRequest) agent.RunResult 
 			"elapsed_ms", elapsed.Milliseconds(),
 			"output", truncate(combined.Bytes()),
 		)
-		return agent.RunResult{Status: domain.StatusFailed, Err: err}
+		return agent.RunResult{Status: domain.StatusFailed, Err: err, Output: output}
 	}
 
 	r.log.Info("agent succeeded",
 		"issue", req.Issue.Identifier,
 		"elapsed_ms", elapsed.Milliseconds(),
 	)
-	return agent.RunResult{Status: domain.StatusSucceeded}
+	return agent.RunResult{Status: domain.StatusSucceeded, Output: output}
 }
 
 func truncate(b []byte) string {

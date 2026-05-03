@@ -8,16 +8,19 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/chalfel/forge-flow/internal/agent"
 	"github.com/chalfel/forge-flow/internal/agent/shell"
 	agentstub "github.com/chalfel/forge-flow/internal/agent/stub"
+	"github.com/chalfel/forge-flow/internal/captain"
 	"github.com/chalfel/forge-flow/internal/observability"
 	"github.com/chalfel/forge-flow/internal/config"
 	"github.com/chalfel/forge-flow/internal/domain"
@@ -35,12 +38,18 @@ Usage:
   symphony validate <path/to/WORKFLOW.md>
   symphony print    <path/to/WORKFLOW.md>
   symphony run      <path/to/WORKFLOW.md> [--stub] [--once] [--http <addr>]
+  symphony captain  [--demand "..." | --demand-file <p>] [--dry-run] <path/to/WORKFLOW.md>
   symphony version
 
 Flags for run:
   --stub          use in-memory tracker/agent/workspace stubs (dry-run)
   --once          run a single tick and exit (useful for smoke tests)
   --http <addr>   serve observability dashboard + JSON API at the given addr
+
+Flags for captain:
+  --demand <s>       high-level demand text (or pass via stdin if omitted)
+  --demand-file <p>  read the demand from a file
+  --dry-run          plan only; print proposed tickets without writing to tracker
 `
 
 func main() {
@@ -58,6 +67,8 @@ func main() {
 		os.Exit(runPrint(args[1:]))
 	case "run":
 		os.Exit(runRun(args[1:]))
+	case "captain":
+		os.Exit(runCaptain(args[1:]))
 	case "version":
 		fmt.Println("symphony 0.1.0")
 	default:
@@ -241,6 +252,155 @@ func firstOr(xs []string, fallback string) string {
 		return xs[0]
 	}
 	return fallback
+}
+
+func runCaptain(args []string) int {
+	fs := flag.NewFlagSet("captain", flag.ContinueOnError)
+	demand := fs.String("demand", "", "high-level demand text (or stdin if empty)")
+	demandFile := fs.String("demand-file", "", "read demand from file")
+	dryRun := fs.Bool("dry-run", false, "plan only; do not write to tracker")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(os.Stderr, "captain requires <path/to/WORKFLOW.md>")
+		return 2
+	}
+	wf, err := config.Load(fs.Arg(0))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load: %v\n", err)
+		return 1
+	}
+	if err := wf.Validate(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	body, err := readDemand(*demand, *demandFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "demand: %v\n", err)
+		return 2
+	}
+	if strings.TrimSpace(body) == "" {
+		fmt.Fprintln(os.Stderr, "demand is empty; pass --demand, --demand-file, or pipe via stdin")
+		return 2
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	ag, err := buildCaptainAgent(wf, logger)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "captain agent: %v\n", err)
+		return 1
+	}
+	tr, err := buildTracker(wf, false)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "tracker: %v\n", err)
+		return 1
+	}
+	writer, ok := tr.(tracker.Writer)
+	if !ok && !*dryRun {
+		fmt.Fprintf(os.Stderr, "tracker %q does not support writes; rerun with --dry-run or use a writable tracker\n", wf.Tracker.Kind)
+		return 1
+	}
+
+	cap, err := captain.New(captain.Options{
+		Config: wf,
+		Agent:  ag,
+		Writer: writer,
+		Logger: logger,
+	})
+	if err != nil {
+		// dry-run path with no writer is allowed; reconstruct the captain with a no-op writer
+		if !*dryRun {
+			fmt.Fprintf(os.Stderr, "captain: %v\n", err)
+			return 1
+		}
+		cap, err = captain.New(captain.Options{
+			Config: wf,
+			Agent:  ag,
+			Writer: noopWriter{},
+			Logger: logger,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "captain: %v\n", err)
+			return 1
+		}
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	cwd, _ := os.Getwd()
+	drafts, _, err := cap.Plan(ctx, body, cwd)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "plan: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(os.Stderr, "planned %d ticket(s):\n", len(drafts))
+	for i, d := range drafts {
+		fmt.Fprintf(os.Stderr, "  %d. [%s] %s\n", i+1, strings.Join(d.Labels, ","), d.Title)
+	}
+	if *dryRun {
+		return 0
+	}
+	res, err := cap.Create(ctx, drafts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "create: %v (created %d before failure)\n", err, len(res.Created))
+		return 1
+	}
+	fmt.Fprintf(os.Stderr, "created %d ticket(s):\n", len(res.Created))
+	for _, is := range res.Created {
+		fmt.Fprintf(os.Stderr, "  - %s — %s\n", is.Identifier, is.URL)
+	}
+	return 0
+}
+
+func readDemand(inline, path string) (string, error) {
+	if inline != "" {
+		return inline, nil
+	}
+	if path != "" {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	}
+	// Fall back to stdin if it isn't a tty.
+	stat, err := os.Stdin.Stat()
+	if err != nil {
+		return "", err
+	}
+	if stat.Mode()&os.ModeCharDevice != 0 {
+		return "", nil // tty without explicit demand
+	}
+	b, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+func buildCaptainAgent(wf *config.Workflow, logger *slog.Logger) (agent.Agent, error) {
+	cmd := wf.Captain.Command
+	turn := wf.Captain.TurnTimeoutMs
+	if cmd == "" {
+		// Fall back to the configured worker agent's command — usually fine
+		// for planning since we're using the same model.
+		fallback := wf.AgentCommandFor()
+		cmd = fallback.Command
+		if turn == 0 {
+			turn = fallback.TurnTimeoutMs
+		}
+	}
+	return shell.New(shell.Options{Command: cmd, TurnTimeoutMs: turn, Logger: logger})
+}
+
+// noopWriter satisfies tracker.Writer for `--dry-run` so the captain still
+// constructs without a writable tracker. Plan does not touch the writer.
+type noopWriter struct{}
+
+func (noopWriter) CreateIssue(_ context.Context, _ domain.IssueDraft) (*domain.Issue, error) {
+	return nil, fmt.Errorf("dry-run: writer disabled")
 }
 
 // buildAgent wires the configured agent runner. Both `codex` and

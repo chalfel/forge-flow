@@ -81,6 +81,70 @@ func (t *Tracker) FetchCandidates(ctx context.Context, activeStates []string) ([
 	return out, nil
 }
 
+// CreateIssue writes a captain-authored draft via the `issueCreate` mutation.
+// Linear's GraphQL requires the project's UUID (not slug) and team via team
+// lookup; we resolve both up-front in a single query before the mutation.
+func (t *Tracker) CreateIssue(ctx context.Context, draft domain.IssueDraft) (*domain.Issue, error) {
+	// Resolve project UUID + team UUID from the configured slug.
+	const lookup = `query Lookup($slug: String!) {
+		projects(first: 1, filter: { slugId: { eq: $slug } }) {
+			nodes { id teams(first: 1) { nodes { id } } }
+		}
+	}`
+	var lookupResp struct {
+		Projects struct {
+			Nodes []struct {
+				ID    string `json:"id"`
+				Teams struct {
+					Nodes []struct{ ID string `json:"id"` } `json:"nodes"`
+				} `json:"teams"`
+			} `json:"nodes"`
+		} `json:"projects"`
+	}
+	if err := t.do(ctx, lookup, map[string]any{"slug": t.projectSlug}, &lookupResp); err != nil {
+		return nil, fmt.Errorf("linear: project lookup: %w", err)
+	}
+	if len(lookupResp.Projects.Nodes) == 0 {
+		return nil, fmt.Errorf("linear: project slug %q not found", t.projectSlug)
+	}
+	projectID := lookupResp.Projects.Nodes[0].ID
+	teams := lookupResp.Projects.Nodes[0].Teams.Nodes
+	if len(teams) == 0 {
+		return nil, fmt.Errorf("linear: project %q has no teams", t.projectSlug)
+	}
+	teamID := teams[0].ID
+
+	const mutation = `mutation Create($input: IssueCreateInput!) {
+		issueCreate(input: $input) {
+			success
+			issue { ` + issueFields + ` }
+		}
+	}`
+	input := map[string]any{
+		"title":       draft.Title,
+		"description": draft.Description,
+		"projectId":   projectID,
+		"teamId":      teamID,
+	}
+	if draft.Priority > 0 {
+		input["priority"] = draft.Priority
+	}
+	var resp struct {
+		IssueCreate struct {
+			Success bool      `json:"success"`
+			Issue   *rawIssue `json:"issue"`
+		} `json:"issueCreate"`
+	}
+	if err := t.do(ctx, mutation, map[string]any{"input": input}, &resp); err != nil {
+		return nil, fmt.Errorf("linear: issueCreate: %w", err)
+	}
+	if !resp.IssueCreate.Success || resp.IssueCreate.Issue == nil {
+		return nil, fmt.Errorf("linear: issueCreate did not return an issue")
+	}
+	is := resp.IssueCreate.Issue.toDomain()
+	return &is, nil
+}
+
 func (t *Tracker) GetIssue(ctx context.Context, id string) (*domain.Issue, error) {
 	const query = `query GetIssue($id: String!) {
 		issue(id: $id) { ` + issueFields + ` }

@@ -91,6 +91,25 @@ func (t *Tracker) FetchCandidates(ctx context.Context, activeStates []string) ([
 	return out, nil
 }
 
+// CreateIssue posts a captain-authored draft to /repos/{owner}/{repo}/issues.
+// Labels from the draft are passed through; callers should ensure at least
+// one matches the workflow's active_states or Symphony will not pick the
+// issue up.
+func (t *Tracker) CreateIssue(ctx context.Context, draft domain.IssueDraft) (*domain.Issue, error) {
+	u := fmt.Sprintf("%s/repos/%s/%s/issues", t.endpoint, t.owner, t.repo)
+	body := map[string]any{
+		"title":  draft.Title,
+		"body":   draft.Description,
+		"labels": draft.Labels,
+	}
+	var ri rawIssue
+	if err := t.doJSON(ctx, http.MethodPost, u, body, &ri); err != nil {
+		return nil, fmt.Errorf("github: create issue: %w", err)
+	}
+	is := ri.toDomain(t.owner, t.repo, t.activeLabels)
+	return &is, nil
+}
+
 func (t *Tracker) GetIssue(ctx context.Context, id string) (*domain.Issue, error) {
 	number, err := parseIDToNumber(id, t.owner, t.repo)
 	if err != nil {
@@ -232,11 +251,28 @@ func parseIDToNumber(id, owner, repo string) (int, error) {
 	return n, nil
 }
 
+func (t *Tracker) doJSON(ctx context.Context, method, u string, body, out any) error {
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, method, u, strings.NewReader(string(encoded)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return t.execute(req, out)
+}
+
 func (t *Tracker) do(ctx context.Context, method, u string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, method, u, nil)
 	if err != nil {
 		return err
 	}
+	return t.execute(req, out)
+}
+
+func (t *Tracker) execute(req *http.Request, out any) error {
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", apiVersion)
 	req.Header.Set("Authorization", "Bearer "+t.apiKey)
@@ -253,6 +289,9 @@ func (t *Tracker) do(ctx context.Context, method, u string, out any) error {
 	}
 	if res.StatusCode/100 != 2 {
 		return fmt.Errorf("status %d: %s", res.StatusCode, truncate(body, 500))
+	}
+	if out == nil {
+		return nil
 	}
 	return json.Unmarshal(body, out)
 }

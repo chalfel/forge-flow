@@ -5,18 +5,51 @@ package stub
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/chalfel/forge-flow/internal/domain"
 )
 
 type Tracker struct {
-	mu     sync.Mutex
-	issues map[string]domain.Issue
+	mu      sync.Mutex
+	issues  map[string]domain.Issue
+	created []domain.IssueDraft
+	nextN   int
 }
 
 func New() *Tracker {
 	return &Tracker{issues: make(map[string]domain.Issue)}
+}
+
+// CreateIssue records the draft and synthesises an Issue with a fresh ID so
+// the captain integration tests can assert on what was written without
+// touching a real tracker.
+func (t *Tracker) CreateIssue(_ context.Context, draft domain.IssueDraft) (*domain.Issue, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.created = append(t.created, draft)
+	t.nextN++
+	id := fmt.Sprintf("stub-%d", t.nextN)
+	is := domain.Issue{
+		ID:          id,
+		Identifier:  fmt.Sprintf("STUB-%d", t.nextN),
+		Title:       draft.Title,
+		Description: draft.Description,
+		Priority:    draft.Priority,
+		Labels:      draft.Labels,
+	}
+	t.issues[id] = is
+	return &is, nil
+}
+
+// Created returns the drafts that have been written via CreateIssue.
+func (t *Tracker) Created() []domain.IssueDraft {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]domain.IssueDraft, len(t.created))
+	copy(out, t.created)
+	return out
 }
 
 func (t *Tracker) Set(issue domain.Issue) {
