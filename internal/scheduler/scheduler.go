@@ -208,7 +208,7 @@ func (s *Scheduler) dispatch(ctx context.Context, issue domain.Issue) {
 			s.send(ctx, completion{issue: issue, attempt: attempt, result: agent.RunResult{Status: domain.StatusFailed, Err: err}})
 			return
 		}
-		prompt := renderPrompt(s.currentCfg().PromptBody, issue, attempt)
+		prompt := renderPrompt(s.currentCfg().PromptBody, issue, attempt, ws.Path)
 		res := s.agent.Run(ctx, agent.RunRequest{
 			Issue:     issue,
 			Attempt:   attempt,

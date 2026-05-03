@@ -37,6 +37,10 @@ claude_code:
 
 You are working on issue **{{ issue.identifier }} — {{ issue.title }}** (attempt {{ attempt }}).
 
+## Skills you can invoke
+
+{{ skills }}
+
 ## Plan
 1. Read the issue description and any linked context.
 2. Identify the smallest viable change that resolves the ticket end-to-end.

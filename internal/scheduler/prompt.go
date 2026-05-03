@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/chalfel/forge-flow/internal/domain"
+	"github.com/chalfel/forge-flow/internal/skills"
 )
 
 // placeholderRE matches `{{ name }}` and `{{ namespace.field }}` with any
@@ -14,11 +15,15 @@ import (
 // prompt body can be plain markdown without escaping concerns.
 var placeholderRE = regexp.MustCompile(`{{\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\s*}}`)
 
-// renderPrompt expands `{{ issue.* }}` and `{{ attempt }}` placeholders. Any
-// unknown placeholder is left intact so a typo surfaces in the rendered
-// output rather than silently disappearing.
-func renderPrompt(body string, issue domain.Issue, attempt int) string {
+// renderPrompt expands `{{ issue.* }}`, `{{ attempt }}`, and `{{ skills }}`
+// placeholders. Skills are discovered from the workspace; pass an empty path
+// (or a workspace without a .symphony/skills directory) to render the empty
+// inventory note. Unknown placeholders are left intact so typos surface.
+func renderPrompt(body string, issue domain.Issue, attempt int, workspaceRoot string) string {
 	vars := promptVars(issue, attempt)
+	if found, _ := skills.Discover(workspaceRoot); found != nil || workspaceRoot != "" {
+		vars["skills"] = skills.Render(found)
+	}
 	return placeholderRE.ReplaceAllStringFunc(body, func(match string) string {
 		key := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(match, "{{"), "}}"))
 		if v, ok := vars[key]; ok {
