@@ -291,14 +291,44 @@ preparing_workspace → building_prompt → launching_agent_process →
 
 ## Spec compliance
 
-forge-flow is a Go implementation of the Symphony [SPEC.md](https://github.com/openai/symphony/blob/main/SPEC.md) with these documented extensions:
+forge-flow is a Go implementation of the Symphony [SPEC.md](https://github.com/openai/symphony/blob/main/SPEC.md). Every requirement labelled "must" in the spec is enforced:
 
-- **GitHub Issues** as a tracker (the spec lists Linear; this adapter overlays state via labels)
-- **Claude Code** as an agent (alongside Codex; both via the shell runner)
+| spec requirement                                 | status |
+| ------------------------------------------------ | ------ |
+| WORKFLOW.md parser (front matter + body)         | ✅     |
+| `$VAR` env-var resolution + path normalisation   | ✅     |
+| Startup config validation (kind, key, command)   | ✅     |
+| Dynamic reload (invalid keeps previous valid)    | ✅     |
+| Claim state machine (Unclaimed → Released)       | ✅     |
+| Per-tick reconciliation of running issues        | ✅     |
+| Sort by priority then created_at                 | ✅     |
+| Eligibility (fields, blockers, concurrency)      | ✅     |
+| Continuation retry (1s) + exponential backoff    | ✅     |
+| Workspace path containment (root-relative)       | ✅     |
+| Workspace key sanitised to `[A-Za-z0-9._-]`      | ✅     |
+| Hook lifecycle: after_create / before_run / …    | ✅     |
+| Hook timeout (default 60s)                       | ✅     |
+| Read / turn / stall timeouts (independent)       | ✅     |
+| Agent cwd validated before launch                | ✅     |
+| `session_id` in structured logs                  | ✅     |
+| Snapshot API (state, refresh, per-issue)         | ✅     |
+| HTTP dashboard at `/`                            | ✅     |
+| Tracker fetch-failure tolerance (skip + retry)   | ✅     |
+| Startup terminal cleanup (orphan workspaces)     | ✅     |
+
+Documented extensions beyond the spec:
+
+- **GitHub Issues** tracker (state overlaid via labels)
+- **Claude Code** agent alongside Codex
 - **Skills** convention (`.symphony/skills/<name>/`) and `{{ skills }}` prompt placeholder
-- **Captain** subcommand and watch-label routing for demand → tickets
+- **Captain** subcommand + watch-label routing for demand → tickets
 
-Mandatory baseline safety invariants are enforced (workspace path containment, sanitised directory names, hook timeouts). Optional capabilities not yet implemented include: token / rate-limit telemetry, persistent retry queue across restarts, Codex app-server stdio JSON-RPC, and tracker-side state transitions on captain success (operators currently remove the watch label manually).
+Optional spec items still on the roadmap:
+
+- **Token / rate-limit telemetry** — `LiveSession` carries fields; the shell runner does not parse them yet (Codex app-server stdio JSON-RPC would supply them natively)
+- **Persistent retry queue across restarts** — spec explicitly allows this to be skipped; tracker is the source of truth
+- **`linear_graphql` agent tool** — optional capability; not implemented
+- **Captain → tracker state transitions** — captain currently relies on the in-memory skip set + manual label removal to prevent re-dispatch of decomposed parents
 
 ## Status
 

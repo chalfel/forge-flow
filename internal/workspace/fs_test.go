@@ -148,6 +148,50 @@ func TestCleanup_RunsAfterRun(t *testing.T) {
 	}
 }
 
+func TestPruneOrphans_RemovesUnknownDirsAndKeepsActive(t *testing.T) {
+	fs := newFS(t, config.Hooks{TimeoutMs: 5000})
+	// Create three workspaces.
+	for _, id := range []string{"ABC-1", "ABC-2", "ABC-3"} {
+		if _, err := fs.Prepare(context.Background(), domain.Issue{ID: id, Identifier: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pruned, err := fs.PruneOrphans(context.Background(), []string{"ABC-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pruned != 2 {
+		t.Fatalf("expected 2 pruned, got %d", pruned)
+	}
+	// ABC-1 must still exist.
+	if _, err := os.Stat(filepath.Join(fs.root, "ABC-1")); err != nil {
+		t.Errorf("active workspace missing: %v", err)
+	}
+	// ABC-2 and ABC-3 must be gone.
+	for _, gone := range []string{"ABC-2", "ABC-3"} {
+		if _, err := os.Stat(filepath.Join(fs.root, gone)); !os.IsNotExist(err) {
+			t.Errorf("orphan %s should be removed, err=%v", gone, err)
+		}
+	}
+}
+
+func TestPruneOrphans_HonoursBeforeRemoveHook(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "before-remove-marker")
+	fs := newFS(t, config.Hooks{
+		BeforeRemove: "touch " + marker,
+		TimeoutMs:    5000,
+	})
+	if _, err := fs.Prepare(context.Background(), domain.Issue{ID: "1", Identifier: "ABC-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fs.PruneOrphans(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("before_remove did not run during prune: %v", err)
+	}
+}
+
 func TestRemove_RunsBeforeRemoveAndDeletes(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "before-remove-marker")
 	fs := newFS(t, config.Hooks{

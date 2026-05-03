@@ -19,3 +19,13 @@ type Manager interface {
 	// do not affect attempt status.
 	Cleanup(ctx context.Context, ws domain.Workspace) error
 }
+
+// Pruner is an optional capability for workspace managers that can clean up
+// stale per-issue directories at startup. Symphony has no persistent
+// scheduler database, so on restart it cannot know which workspaces are
+// still in flight without consulting the tracker. Operators that want
+// orphan cleanup pass the active issue identifiers in and the manager
+// removes any directory whose key does not match.
+type Pruner interface {
+	PruneOrphans(ctx context.Context, activeKeys []string) (int, error)
+}

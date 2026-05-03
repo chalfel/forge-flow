@@ -115,6 +115,44 @@ func (f *FS) Cleanup(ctx context.Context, ws domain.Workspace) error {
 	return nil
 }
 
+// PruneOrphans removes per-issue subdirectories under the root whose
+// sanitised keys are not in activeKeys. before_remove runs for each pruned
+// dir (logged-as-skipped on failure). Returns the number of directories
+// removed.
+func (f *FS) PruneOrphans(ctx context.Context, activeKeys []string) (int, error) {
+	keep := make(map[string]struct{}, len(activeKeys))
+	for _, k := range activeKeys {
+		keep[SanitizeKey(k)] = struct{}{}
+	}
+	entries, err := os.ReadDir(f.root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("workspace prune: read root: %w", err)
+	}
+	pruned := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, ok := keep[e.Name()]; ok {
+			continue
+		}
+		path := filepath.Join(f.root, e.Name())
+		if err := f.runHook(ctx, "before_remove", f.hooks.BeforeRemove, path); err != nil {
+			f.log.Warn("prune: before_remove failed; continuing", "path", path, "err", err)
+		}
+		if err := os.RemoveAll(path); err != nil {
+			f.log.Warn("prune: remove failed; continuing", "path", path, "err", err)
+			continue
+		}
+		f.log.Info("prune: removed orphan workspace", "path", path)
+		pruned++
+	}
+	return pruned, nil
+}
+
 // Remove runs before_remove and deletes the directory. Not invoked
 // automatically by the scheduler; available for operators who want to wipe
 // workspaces between cycles.

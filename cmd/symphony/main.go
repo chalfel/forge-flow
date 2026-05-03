@@ -204,6 +204,15 @@ func runRun(args []string) int {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// Spec gap fix: startup terminal cleanup. Prune workspace directories
+	// whose key is not currently in the active set on the tracker. Skipped
+	// in stub mode (no real workspace) and best-effort otherwise.
+	if !*stub {
+		if err := pruneOrphanWorkspaces(ctx, tr, ws, wf, logger); err != nil {
+			logger.Warn("startup workspace prune failed; continuing", "err", err)
+		}
+	}
+
 	// Live reload of WORKFLOW.md. Skipped in --once mode where the loop
 	// exits before any meaningful edit window.
 	if !*once {
@@ -414,6 +423,32 @@ type noopWriter struct{}
 
 func (noopWriter) CreateIssue(_ context.Context, _ domain.IssueDraft) (*domain.Issue, error) {
 	return nil, fmt.Errorf("dry-run: writer disabled")
+}
+
+// pruneOrphanWorkspaces queries the tracker for active issues and removes
+// any workspace directory whose sanitised key is not in that set. Best
+// effort: errors are logged and the loop continues.
+func pruneOrphanWorkspaces(ctx context.Context, tr tracker.Tracker, ws workspace.Manager, wf *config.Workflow, logger *slog.Logger) error {
+	pruner, ok := ws.(workspace.Pruner)
+	if !ok {
+		return nil
+	}
+	issues, err := tr.FetchCandidates(ctx, wf.Tracker.ActiveStates)
+	if err != nil {
+		return fmt.Errorf("fetch active issues: %w", err)
+	}
+	keys := make([]string, 0, len(issues))
+	for _, i := range issues {
+		keys = append(keys, i.Identifier)
+	}
+	pruned, err := pruner.PruneOrphans(ctx, keys)
+	if err != nil {
+		return err
+	}
+	if pruned > 0 {
+		logger.Info("startup pruned orphan workspaces", "count", pruned)
+	}
+	return nil
 }
 
 // buildCaptainRoutingAgent wires a captain.Agent backed by the captain

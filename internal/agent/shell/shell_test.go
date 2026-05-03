@@ -101,3 +101,40 @@ func TestNew_RequiresCommand(t *testing.T) {
 	}
 }
 
+func TestRun_StallTimeoutMapsToStalled(t *testing.T) {
+	// `sleep 5` produces no stdout. With a 200ms stall budget the watchdog
+	// should kill the process well before the turn timeout would fire and
+	// return StatusStalled.
+	r, err := New(Options{
+		Command:        "sleep 5",
+		TurnTimeoutMs:  10_000,
+		StallTimeoutMs: 200,
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := r.Run(context.Background(), tmpReq(t, ""))
+	if res.Status != domain.StatusStalled {
+		t.Fatalf("expected Stalled, got %s (err=%v)", res.Status, res.Err)
+	}
+}
+
+func TestRun_OutputResetsStallWatchdog(t *testing.T) {
+	// Print a line every 50ms for ~400ms; a 200ms stall budget must NOT
+	// fire because the watchdog sees fresh activity.
+	r, err := New(Options{
+		Command:        "for i in 1 2 3 4 5 6 7 8; do echo $i; sleep 0.05; done",
+		TurnTimeoutMs:  10_000,
+		StallTimeoutMs: 200,
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := r.Run(context.Background(), tmpReq(t, ""))
+	if res.Status != domain.StatusSucceeded {
+		t.Fatalf("expected Succeeded, got %s (err=%v output=%q)", res.Status, res.Err, res.Output)
+	}
+}
+
