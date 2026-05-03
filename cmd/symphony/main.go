@@ -19,6 +19,7 @@ import (
 	"github.com/chalfel/forge-flow/internal/domain"
 	"github.com/chalfel/forge-flow/internal/scheduler"
 	"github.com/chalfel/forge-flow/internal/tracker"
+	githubtracker "github.com/chalfel/forge-flow/internal/tracker/github"
 	"github.com/chalfel/forge-flow/internal/tracker/linear"
 	trackerstub "github.com/chalfel/forge-flow/internal/tracker/stub"
 	"github.com/chalfel/forge-flow/internal/workspace"
@@ -224,7 +225,11 @@ func buildTracker(wf *config.Workflow, useStub bool) (tracker.Tracker, error) {
 			ProjectSlug: wf.Tracker.ProjectSlug,
 		}), nil
 	case config.TrackerGitHub:
-		return nil, fmt.Errorf("github tracker not yet implemented (phase 4)")
+		return githubtracker.New(githubtracker.Options{
+			APIKey:       wf.Tracker.APIKey,
+			Repo:         wf.Tracker.Repo,
+			ActiveStates: wf.Tracker.ActiveStates,
+		})
 	default:
 		return nil, fmt.Errorf("unsupported tracker.kind %q", wf.Tracker.Kind)
 	}
