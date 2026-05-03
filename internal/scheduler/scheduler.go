@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/chalfel/forge-flow/internal/agent"
@@ -32,17 +33,18 @@ type realClock struct{}
 func (realClock) Now() time.Time { return time.Now() }
 
 type Scheduler struct {
-	cfg       *config.Workflow
+	cfg       atomic.Pointer[config.Workflow]
 	tracker   tracker.Tracker
 	agent     agent.Agent
 	workspace workspace.Manager
 	store     *Store
-	backoff   Backoff
+	backoff   atomic.Pointer[Backoff]
 	clock     Clock
 	log       *slog.Logger
 
 	completions chan completion
 	refresh     chan struct{}
+	cfgChanged  chan struct{}
 	wg          sync.WaitGroup
 }
 
@@ -68,19 +70,39 @@ func New(opts Options) *Scheduler {
 	if opts.Clock == nil {
 		opts.Clock = realClock{}
 	}
-	return &Scheduler{
-		cfg:         opts.Config,
+	s := &Scheduler{
 		tracker:     opts.Tracker,
 		agent:       opts.Agent,
 		workspace:   opts.Workspace,
 		store:       NewStore(),
-		backoff:     DefaultBackoff(opts.Config.Agent.MaxRetryBackoffMs),
 		clock:       opts.Clock,
 		log:         opts.Logger,
 		completions: make(chan completion, 64),
 		refresh:     make(chan struct{}, 1),
+		cfgChanged:  make(chan struct{}, 1),
+	}
+	s.cfg.Store(opts.Config)
+	bo := DefaultBackoff(opts.Config.Agent.MaxRetryBackoffMs)
+	s.backoff.Store(&bo)
+	return s
+}
+
+// SetConfig atomically swaps the workflow. Most fields (prompt body,
+// active/terminal states, hooks, concurrency, agent command) take effect on
+// the next Tick. Polling cadence is honoured by the Run loop, which
+// recreates its ticker when notified via cfgChanged.
+func (s *Scheduler) SetConfig(wf *config.Workflow) {
+	s.cfg.Store(wf)
+	bo := DefaultBackoff(wf.Agent.MaxRetryBackoffMs)
+	s.backoff.Store(&bo)
+	select {
+	case s.cfgChanged <- struct{}{}:
+	default:
 	}
 }
+
+func (s *Scheduler) currentCfg() *config.Workflow { return s.cfg.Load() }
+func (s *Scheduler) currentBackoff() Backoff      { return *s.backoff.Load() }
 
 // Refresh requests an immediate tick. Multiple concurrent calls collapse to
 // a single tick because the channel has capacity 1. Used by the
@@ -92,17 +114,17 @@ func (s *Scheduler) Refresh() {
 	}
 }
 
-// Config exposes the workflow for read-only observability surfaces.
-func (s *Scheduler) Config() *config.Workflow { return s.cfg }
+// Config exposes the workflow for read-only observability surfaces. Returns
+// the currently active workflow after any dynamic reload.
+func (s *Scheduler) Config() *config.Workflow { return s.currentCfg() }
 
 // Run drives the scheduler until ctx is canceled. Each tick polls the tracker
 // and dispatches eligible issues; completions arrive asynchronously on the
 // channel. Run returns nil on graceful shutdown after all in-flight runs
 // finish.
 func (s *Scheduler) Run(ctx context.Context) error {
-	interval := time.Duration(s.cfg.Polling.IntervalMs) * time.Millisecond
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	ticker := time.NewTicker(s.tickInterval())
+	defer func() { ticker.Stop() }()
 
 	if err := s.Tick(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		s.log.Error("initial tick", "err", err)
@@ -118,12 +140,20 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			if err := s.Tick(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				s.log.Error("refresh tick", "err", err)
 			}
+		case <-s.cfgChanged:
+			ticker.Stop()
+			ticker = time.NewTicker(s.tickInterval())
+			s.log.Info("workflow reloaded; ticker restarted", "interval_ms", s.currentCfg().Polling.IntervalMs)
 		case <-ticker.C:
 			if err := s.Tick(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				s.log.Error("tick", "err", err)
 			}
 		}
 	}
+}
+
+func (s *Scheduler) tickInterval() time.Duration {
+	return time.Duration(s.currentCfg().Polling.IntervalMs) * time.Millisecond
 }
 
 // Tick performs one polling iteration synchronously: drain ready completions,
@@ -137,18 +167,19 @@ func (s *Scheduler) Tick(ctx context.Context) error {
 		s.log.Info("retries promoted", "count", len(promoted))
 	}
 
-	issues, err := s.tracker.FetchCandidates(ctx, s.cfg.Tracker.ActiveStates)
+	cfg := s.currentCfg()
+	issues, err := s.tracker.FetchCandidates(ctx, cfg.Tracker.ActiveStates)
 	if err != nil {
 		return err
 	}
 	sortByPriorityThenCreated(issues)
 
-	slots := s.cfg.Agent.MaxConcurrentAgents - s.store.RunningCount()
+	slots := cfg.Agent.MaxConcurrentAgents - s.store.RunningCount()
 	for _, issue := range issues {
 		if slots <= 0 {
 			break
 		}
-		eli := eligible(issue, s.store, s.cfg.Tracker.TerminalStates)
+		eli := eligible(issue, s.store, cfg.Tracker.TerminalStates)
 		if !eli.OK {
 			s.log.Debug("ineligible", "issue", issue.Identifier, "reason", eli.Reason)
 			continue
@@ -177,7 +208,7 @@ func (s *Scheduler) dispatch(ctx context.Context, issue domain.Issue) {
 			s.send(ctx, completion{issue: issue, attempt: attempt, result: agent.RunResult{Status: domain.StatusFailed, Err: err}})
 			return
 		}
-		prompt := renderPrompt(s.cfg.PromptBody, issue, attempt)
+		prompt := renderPrompt(s.currentCfg().PromptBody, issue, attempt)
 		res := s.agent.Run(ctx, agent.RunRequest{
 			Issue:     issue,
 			Attempt:   attempt,
@@ -222,7 +253,7 @@ func (s *Scheduler) handleCompletion(c completion) {
 		return
 	}
 
-	delay := s.backoff.NextDelay(c.attempt, failed)
+	delay := s.currentBackoff().NextDelay(c.attempt, failed)
 	dueAt := s.clock.Now().Add(delay)
 	errMsg := ""
 	if c.result.Err != nil {

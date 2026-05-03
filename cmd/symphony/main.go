@@ -180,6 +180,16 @@ func runRun(args []string) int {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// Live reload of WORKFLOW.md. Skipped in --once mode where the loop
+	// exits before any meaningful edit window.
+	if !*once {
+		watcher := config.NewWatcher(config.WatcherOptions{
+			Path:   wf.SourcePath,
+			Logger: logger,
+		})
+		go watcher.Run(ctx, func(newWf *config.Workflow) { s.SetConfig(newWf) })
+	}
+
 	if *httpAddr != "" {
 		obsSrv := observability.NewServer(s)
 		go func() {
