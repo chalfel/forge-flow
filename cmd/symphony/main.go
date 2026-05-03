@@ -18,6 +18,8 @@ import (
 	"github.com/chalfel/forge-flow/internal/config"
 	"github.com/chalfel/forge-flow/internal/domain"
 	"github.com/chalfel/forge-flow/internal/scheduler"
+	"github.com/chalfel/forge-flow/internal/tracker"
+	"github.com/chalfel/forge-flow/internal/tracker/linear"
 	trackerstub "github.com/chalfel/forge-flow/internal/tracker/stub"
 	"github.com/chalfel/forge-flow/internal/workspace"
 )
@@ -133,21 +135,27 @@ func runRun(args []string) int {
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	if !*stub {
-		fmt.Fprintln(os.Stderr, "real tracker/agent adapters not yet implemented; pass --stub for the in-memory dry run")
+	tr, err := buildTracker(wf, *stub)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "tracker: %v\n", err)
 		return 1
 	}
-
-	tr := trackerstub.New()
-	tr.Set(domain.Issue{
-		ID:         "demo-1",
-		Identifier: wf.Tracker.ProjectSlug + "-1",
-		Title:      "stub demo issue",
-		State:      firstOr(wf.Tracker.ActiveStates, "Todo"),
-		CreatedAt:  time.Now(),
-	})
-	ag := agentstub.New()
+	if *stub {
+		// Seed the stub tracker so the loop has something to dispatch.
+		stubTracker, _ := tr.(*trackerstub.Tracker)
+		stubTracker.Set(domain.Issue{
+			ID:         "demo-1",
+			Identifier: wf.Tracker.ProjectSlug + "-1",
+			Title:      "stub demo issue",
+			State:      firstOr(wf.Tracker.ActiveStates, "Todo"),
+			CreatedAt:  time.Now(),
+		})
+	}
+	ag := agentstub.New() // real agent runners land in phases 6 and 7
 	ws := workspace.NewStub()
+	if !*stub {
+		fmt.Fprintln(os.Stderr, "warning: real tracker is wired but agent runners are still stubs; agent.command will not actually execute yet")
+	}
 
 	s := scheduler.New(scheduler.Options{
 		Config:    wf,
@@ -200,4 +208,24 @@ func firstOr(xs []string, fallback string) string {
 		return xs[0]
 	}
 	return fallback
+}
+
+// buildTracker wires the right adapter based on the workflow's tracker kind.
+// `--stub` always overrides to the in-memory tracker so dry-runs work even
+// when the workflow points at a real Linear project.
+func buildTracker(wf *config.Workflow, useStub bool) (tracker.Tracker, error) {
+	if useStub {
+		return trackerstub.New(), nil
+	}
+	switch wf.Tracker.Kind {
+	case config.TrackerLinear:
+		return linear.New(linear.Options{
+			APIKey:      wf.Tracker.APIKey,
+			ProjectSlug: wf.Tracker.ProjectSlug,
+		}), nil
+	case config.TrackerGitHub:
+		return nil, fmt.Errorf("github tracker not yet implemented (phase 4)")
+	default:
+		return nil, fmt.Errorf("unsupported tracker.kind %q", wf.Tracker.Kind)
+	}
 }
