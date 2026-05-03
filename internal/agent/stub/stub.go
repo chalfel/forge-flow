@@ -44,7 +44,7 @@ func (a *Agent) Executed() []agent.RunRequest {
 	return out
 }
 
-func (a *Agent) Run(_ context.Context, req agent.RunRequest) agent.RunResult {
+func (a *Agent) Run(ctx context.Context, req agent.RunRequest) agent.RunResult {
 	a.mu.Lock()
 	a.executed = append(a.executed, req)
 	var res agent.RunResult
@@ -57,7 +57,20 @@ func (a *Agent) Run(_ context.Context, req agent.RunRequest) agent.RunResult {
 	delay := a.delay
 	a.mu.Unlock()
 	if delay != nil {
-		delay(req)
+		done := make(chan struct{})
+		go func() {
+			delay(req)
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			// Stop blocking on the user-supplied delay so the scheduler
+			// can observe the cancellation. The goroutine running delay
+			// remains; tests that rely on this path must arrange to
+			// release it (e.g. via a shared channel) for clean shutdown.
+			return agent.RunResult{Status: domain.StatusFailed, Err: ctx.Err()}
+		}
 	}
 	return res
 }

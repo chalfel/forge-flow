@@ -32,7 +32,7 @@ func TestEligible_MissingFields(t *testing.T) {
 func TestEligible_AlreadyInFlight(t *testing.T) {
 	store := NewStore()
 	store.TryClaim("1")
-	store.MarkRunning("1", time.Now())
+	store.MarkRunning("1", time.Now(), func() {}, "")
 	issue := domain.Issue{ID: "1", Identifier: "ABC-1", Title: "x"}
 	if got := eligible(issue, store, nil); got.OK {
 		t.Fatalf("expected NOT eligible while running")

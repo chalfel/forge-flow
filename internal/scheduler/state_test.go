@@ -47,11 +47,11 @@ func TestRunningCount(t *testing.T) {
 	s := NewStore()
 	s.TryClaim("a")
 	s.TryClaim("b")
-	s.MarkRunning("a", time.Now())
+	s.MarkRunning("a", time.Now(), func() {}, "ss-a")
 	if got := s.RunningCount(); got != 1 {
 		t.Fatalf("expected 1 running, got %d", got)
 	}
-	s.MarkRunning("b", time.Now())
+	s.MarkRunning("b", time.Now(), func() {}, "ss-b")
 	if got := s.RunningCount(); got != 2 {
 		t.Fatalf("expected 2 running, got %d", got)
 	}

@@ -14,6 +14,11 @@ type RunRequest struct {
 	Attempt   int
 	Workspace domain.Workspace
 	Prompt    string
+	// SessionID is a per-attempt opaque correlation token. The scheduler
+	// generates it at dispatch and propagates it for log correlation. Real
+	// Codex app-server protocol implementations should use this as the
+	// thread / turn key.
+	SessionID string
 }
 
 type RunResult struct {

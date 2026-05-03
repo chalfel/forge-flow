@@ -9,9 +9,14 @@ package scheduler
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
+	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -157,10 +162,13 @@ func (s *Scheduler) tickInterval() time.Duration {
 }
 
 // Tick performs one polling iteration synchronously: drain ready completions,
-// promote due retries, fetch candidates, sort, dispatch up to concurrency.
-// It is exported so tests can step the loop without timing dependencies.
+// reconcile running issues against the tracker (cancel any whose state moved
+// out of active), promote due retries, fetch candidates, sort, dispatch up to
+// concurrency. Exported so tests can step the loop without timing
+// dependencies.
 func (s *Scheduler) Tick(ctx context.Context) error {
 	s.drainCompletions()
+	s.reconcileRunning(ctx)
 
 	now := s.clock.Now()
 	if promoted := s.store.PromoteDueRetries(now); len(promoted) > 0 {
@@ -194,27 +202,53 @@ func (s *Scheduler) Tick(ctx context.Context) error {
 }
 
 // dispatch launches the workspace prep + prompt render + agent run on a
-// goroutine. The result lands on s.completions so the next Tick reconciles.
+// goroutine. The goroutine derives its context from a per-attempt cancel
+// function so reconciliation can interrupt the run when the tracker moves
+// the issue to a terminal state. The result lands on s.completions.
 func (s *Scheduler) dispatch(ctx context.Context, issue domain.Issue) {
 	attempt := s.store.Attempt(issue.ID)
-	s.store.MarkRunning(issue.ID, s.clock.Now())
-	s.log.Info("dispatch", "issue", issue.Identifier, "attempt", attempt)
+	runCtx, cancel := context.WithCancel(ctx)
+	sessionID := newSessionID()
+	s.store.MarkRunning(issue.ID, s.clock.Now(), cancel, sessionID)
+	s.log.Info("dispatch", "issue", issue.Identifier, "attempt", attempt, "session_id", sessionID)
 
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		ws, err := s.workspace.Prepare(ctx, issue)
+		defer cancel()
+		ws, err := s.workspace.Prepare(runCtx, issue)
 		if err != nil {
 			s.send(ctx, completion{issue: issue, attempt: attempt, result: agent.RunResult{Status: domain.StatusFailed, Err: err}})
 			return
 		}
+		// SPEC.md mandatory baseline: validate cwd before launch. We only
+		// enforce when the workflow declares a root; an empty root means
+		// "no production constraint" and is used by the in-memory test
+		// stubs. The FS workspace manager always sets a real root.
+		if root := s.currentCfg().Workspace.Root; root != "" {
+			if err := assertContained(root, ws.Path); err != nil {
+				_ = s.workspace.Cleanup(ctx, ws)
+				s.send(ctx, completion{issue: issue, attempt: attempt, result: agent.RunResult{Status: domain.StatusFailed, Err: err}})
+				return
+			}
+		}
 		prompt := renderPrompt(s.currentCfg().PromptBody, issue, attempt, ws.Path)
-		res := s.agent.Run(ctx, agent.RunRequest{
+		res := s.agent.Run(runCtx, agent.RunRequest{
 			Issue:     issue,
 			Attempt:   attempt,
 			Workspace: ws,
 			Prompt:    prompt,
+			SessionID: sessionID,
 		})
+		// If reconciliation cancelled us, override the agent's status so
+		// the scheduler treats it as a reconciliation cancellation rather
+		// than a generic failure.
+		if errors.Is(runCtx.Err(), context.Canceled) && ctx.Err() == nil {
+			res.Status = domain.StatusCanceledByReconcile
+			if res.Err == nil {
+				res.Err = context.Canceled
+			}
+		}
 		_ = s.workspace.Cleanup(ctx, ws)
 		s.send(ctx, completion{issue: issue, attempt: attempt, result: res})
 	}()
@@ -296,4 +330,73 @@ func sortByPriorityThenCreated(issues []domain.Issue) {
 		}
 		return issues[i].CreatedAt.Before(issues[j].CreatedAt)
 	})
+}
+
+// reconcileRunning refreshes tracker state for every Running issue. If the
+// tracker no longer reports the issue in any active state (or returns nil),
+// the dispatched goroutine is cancelled — the operator manually moved the
+// ticket on the tracker side and we should not waste compute completing it.
+func (s *Scheduler) reconcileRunning(ctx context.Context) {
+	ids := s.store.RunningIDs()
+	if len(ids) == 0 {
+		return
+	}
+	cfg := s.currentCfg()
+	for _, id := range ids {
+		issue, err := s.tracker.GetIssue(ctx, id)
+		if err != nil {
+			s.log.Warn("reconcile: get_issue failed; skipping", "issue_id", id, "err", err)
+			continue
+		}
+		if issue == nil || !inSet(issue.State, cfg.Tracker.ActiveStates) {
+			if s.store.CancelRunning(id) {
+				s.log.Info("reconcile: cancelling run; tracker state out of active set",
+					"issue_id", id,
+					"tracker_state", trackerStateOrNone(issue))
+			}
+		}
+	}
+}
+
+func inSet(s string, set []string) bool {
+	for _, x := range set {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+func trackerStateOrNone(i *domain.Issue) string {
+	if i == nil {
+		return "<not found>"
+	}
+	return i.State
+}
+
+// assertContained verifies that path lies inside root. Mirrors the same
+// invariant the FS workspace manager enforces; running it here too means a
+// custom Manager cannot accidentally hand the agent a path outside the
+// configured root.
+func assertContained(root, path string) error {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return fmt.Errorf("workspace containment: %w", err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("workspace path %q escapes root %q", path, root)
+	}
+	return nil
+}
+
+// newSessionID returns a short opaque identifier suitable for log
+// correlation. The shell runner does not have a real Codex thread/turn
+// session, so we mint one ourselves so structured logs include the
+// `session_id` key required by the spec.
+func newSessionID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("ss-%d", time.Now().UnixNano())
+	}
+	return "ss-" + hex.EncodeToString(b[:])
 }

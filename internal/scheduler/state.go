@@ -19,11 +19,17 @@ const (
 )
 
 type entry struct {
-	state    ClaimState
-	attempt  int
-	dueAt    time.Time
-	lastErr  string
+	state     ClaimState
+	attempt   int
+	dueAt     time.Time
+	lastErr   string
 	startedAt time.Time
+	// cancel terminates the dispatched goroutine for a Running issue. It is
+	// installed by MarkRunning and invoked by CancelRunning during
+	// reconciliation when the tracker reports the issue moved out of an
+	// active state.
+	cancel    func()
+	sessionID string
 }
 
 // Store is the in-memory map of issue ID to claim state. Concurrent access is
@@ -78,13 +84,53 @@ func (s *Store) TryClaim(id string) bool {
 	return false
 }
 
-func (s *Store) MarkRunning(id string, now time.Time) {
+func (s *Store) MarkRunning(id string, now time.Time, cancel func(), sessionID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if e, ok := s.entries[id]; ok {
 		e.state = Running
 		e.startedAt = now
+		e.cancel = cancel
+		e.sessionID = sessionID
 	}
+}
+
+// CancelRunning calls the stored cancel function (if any) so the dispatched
+// goroutine unwinds. The state transition itself happens when the goroutine
+// posts its completion (typically with StatusCanceledByReconcile).
+func (s *Store) CancelRunning(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.entries[id]
+	if !ok || e.state != Running || e.cancel == nil {
+		return false
+	}
+	e.cancel()
+	return true
+}
+
+// RunningIDs returns the IDs of issues currently Running. Used by the
+// reconciliation pass to refresh tracker state.
+func (s *Store) RunningIDs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []string
+	for id, e := range s.entries {
+		if e.state == Running {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// SessionID returns the session id stored when MarkRunning was called.
+func (s *Store) SessionID(id string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e, ok := s.entries[id]; ok {
+		return e.sessionID
+	}
+	return ""
 }
 
 // ScheduleRetry moves the issue to RetryQueued with a due time. The retry
@@ -177,6 +223,7 @@ type EntrySnapshot struct {
 	DueAt     time.Time
 	LastErr   string
 	StartedAt time.Time
+	SessionID string
 }
 
 func (s *Store) Snapshot() []EntrySnapshot {
@@ -191,6 +238,7 @@ func (s *Store) Snapshot() []EntrySnapshot {
 			DueAt:     e.dueAt,
 			LastErr:   e.lastErr,
 			StartedAt: e.startedAt,
+			SessionID: e.sessionID,
 		})
 	}
 	return out
