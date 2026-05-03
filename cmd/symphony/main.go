@@ -1,13 +1,25 @@
-// Symphony entry point. Phase 1 supports `validate` and `print`; the daemon
-// loop ships in subsequent phases per the SPEC.md staging.
+// Symphony entry point. Phase 2 adds `run` (daemon loop) on top of the
+// Phase 1 `validate` / `print` subcommands. Real tracker and agent adapters
+// land in subsequent phases — `run --stub` exercises the loop end-to-end
+// with in-memory implementations.
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
+	agentstub "github.com/chalfel/forge-flow/internal/agent/stub"
 	"github.com/chalfel/forge-flow/internal/config"
+	"github.com/chalfel/forge-flow/internal/domain"
+	"github.com/chalfel/forge-flow/internal/scheduler"
+	trackerstub "github.com/chalfel/forge-flow/internal/tracker/stub"
+	"github.com/chalfel/forge-flow/internal/workspace"
 )
 
 const usage = `symphony — orchestrate coding agents from a tracker
@@ -15,7 +27,12 @@ const usage = `symphony — orchestrate coding agents from a tracker
 Usage:
   symphony validate <path/to/WORKFLOW.md>
   symphony print    <path/to/WORKFLOW.md>
+  symphony run      <path/to/WORKFLOW.md> [--stub] [--once]
   symphony version
+
+Flags for run:
+  --stub   use in-memory tracker/agent/workspace (real adapters TBD)
+  --once   run a single tick and exit (useful for smoke tests)
 `
 
 func main() {
@@ -31,6 +48,8 @@ func main() {
 		os.Exit(runValidate(args[1:]))
 	case "print":
 		os.Exit(runPrint(args[1:]))
+	case "run":
+		os.Exit(runRun(args[1:]))
 	case "version":
 		fmt.Println("symphony 0.1.0")
 	default:
@@ -89,4 +108,96 @@ func runPrint(args []string) int {
 	fmt.Println("---")
 	fmt.Print(wf.PromptBody)
 	return 0
+}
+
+func runRun(args []string) int {
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	stub := fs.Bool("stub", false, "use in-memory tracker/agent/workspace stubs")
+	once := fs.Bool("once", false, "run a single tick and exit")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if fs.NArg() != 1 {
+		fmt.Fprintln(os.Stderr, "run requires <path/to/WORKFLOW.md>")
+		return 2
+	}
+	wf, err := config.Load(fs.Arg(0))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load: %v\n", err)
+		return 1
+	}
+	if err := wf.Validate(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	if !*stub {
+		fmt.Fprintln(os.Stderr, "real tracker/agent adapters not yet implemented; pass --stub for the in-memory dry run")
+		return 1
+	}
+
+	tr := trackerstub.New()
+	tr.Set(domain.Issue{
+		ID:         "demo-1",
+		Identifier: wf.Tracker.ProjectSlug + "-1",
+		Title:      "stub demo issue",
+		State:      firstOr(wf.Tracker.ActiveStates, "Todo"),
+		CreatedAt:  time.Now(),
+	})
+	ag := agentstub.New()
+	ws := workspace.NewStub()
+
+	s := scheduler.New(scheduler.Options{
+		Config:    wf,
+		Tracker:   tr,
+		Agent:     ag,
+		Workspace: ws,
+		Logger:    logger,
+	})
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	if *once {
+		if err := s.Tick(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "tick: %v\n", err)
+			return 1
+		}
+		// Give the dispatched goroutine a beat to write its completion.
+		time.Sleep(100 * time.Millisecond)
+		_ = s.Tick(ctx)
+		printSnapshot(s)
+		return 0
+	}
+
+	logger.Info("symphony starting",
+		"source", wf.SourcePath,
+		"tracker", wf.Tracker.Kind,
+		"agent", wf.Agent.Kind,
+		"interval_ms", wf.Polling.IntervalMs,
+	)
+	if err := s.Run(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "run: %v\n", err)
+		return 1
+	}
+	printSnapshot(s)
+	return 0
+}
+
+func printSnapshot(s *scheduler.Scheduler) {
+	snap := s.Snapshot()
+	fmt.Println("--- snapshot ---")
+	for _, e := range snap {
+		fmt.Printf("issue=%s state=%s attempt=%d err=%q\n",
+			e.IssueID, e.State, e.Attempt, e.LastErr)
+	}
+}
+
+func firstOr(xs []string, fallback string) string {
+	if len(xs) > 0 {
+		return xs[0]
+	}
+	return fallback
 }

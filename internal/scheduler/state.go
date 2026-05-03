@@ -1,0 +1,174 @@
+package scheduler
+
+import (
+	"sync"
+	"time"
+)
+
+// ClaimState models the lifecycle of an issue inside the scheduler. The
+// transitions are: Unclaimed → Claimed → Running → (RetryQueued | Released).
+// RetryQueued returns to Claimed when its timer fires.
+type ClaimState string
+
+const (
+	Unclaimed   ClaimState = "unclaimed"
+	Claimed     ClaimState = "claimed"
+	Running     ClaimState = "running"
+	RetryQueued ClaimState = "retry_queued"
+	Released    ClaimState = "released"
+)
+
+type entry struct {
+	state    ClaimState
+	attempt  int
+	dueAt    time.Time
+	lastErr  string
+	startedAt time.Time
+}
+
+// Store is the in-memory map of issue ID to claim state. Concurrent access is
+// guarded by a single mutex; the scheduler does not hold the lock during
+// agent execution, so contention stays low.
+type Store struct {
+	mu      sync.Mutex
+	entries map[string]*entry
+}
+
+func NewStore() *Store {
+	return &Store{entries: make(map[string]*entry)}
+}
+
+// TryClaim atomically transitions an Unclaimed (or absent) issue to Claimed.
+// Returns false when the issue is already in flight or scheduled for retry.
+func (s *Store) TryClaim(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.entries[id]
+	if !ok {
+		s.entries[id] = &entry{state: Claimed}
+		return true
+	}
+	if e.state == Unclaimed || e.state == Released {
+		e.state = Claimed
+		return true
+	}
+	return false
+}
+
+func (s *Store) MarkRunning(id string, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e, ok := s.entries[id]; ok {
+		e.state = Running
+		e.startedAt = now
+	}
+}
+
+// ScheduleRetry moves the issue to RetryQueued with a due time. The retry
+// will be eligible for re-dispatch after `dueAt`.
+func (s *Store) ScheduleRetry(id string, attempt int, dueAt time.Time, errMsg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.entries[id]
+	if !ok {
+		e = &entry{}
+		s.entries[id] = e
+	}
+	e.state = RetryQueued
+	e.attempt = attempt
+	e.dueAt = dueAt
+	e.lastErr = errMsg
+}
+
+// Release transitions to Released and clears retry/error state. Called when
+// a run reaches a terminal state with no continuation, or when reconciliation
+// detects the tracker moved the issue to a terminal state.
+func (s *Store) Release(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e, ok := s.entries[id]; ok {
+		e.state = Released
+		e.dueAt = time.Time{}
+		e.lastErr = ""
+		e.attempt = 0
+	}
+}
+
+func (s *Store) State(id string) (ClaimState, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.entries[id]
+	if !ok {
+		return Unclaimed, false
+	}
+	return e.state, true
+}
+
+// Attempt returns the next attempt number for an issue. First dispatch is 0;
+// retries use 1, 2, 3...
+func (s *Store) Attempt(id string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if e, ok := s.entries[id]; ok {
+		return e.attempt
+	}
+	return 0
+}
+
+// PromoteDueRetries moves any RetryQueued entries whose dueAt is in the past
+// back to Unclaimed so the next dispatch picks them up via the standard
+// eligible/TryClaim path. Attempt count is preserved on the entry.
+func (s *Store) PromoteDueRetries(now time.Time) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var ids []string
+	for id, e := range s.entries {
+		if e.state == RetryQueued && !now.Before(e.dueAt) {
+			e.state = Unclaimed
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// RunningCount counts issues currently in Running state. Used to enforce
+// max_concurrent_agents.
+func (s *Store) RunningCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, e := range s.entries {
+		if e.state == Running {
+			n++
+		}
+	}
+	return n
+}
+
+// Snapshot returns a copy of all entries for observability. Cheap because the
+// dataset is bounded by tracker page size.
+type EntrySnapshot struct {
+	IssueID   string
+	State     ClaimState
+	Attempt   int
+	DueAt     time.Time
+	LastErr   string
+	StartedAt time.Time
+}
+
+func (s *Store) Snapshot() []EntrySnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]EntrySnapshot, 0, len(s.entries))
+	for id, e := range s.entries {
+		out = append(out, EntrySnapshot{
+			IssueID:   id,
+			State:     e.state,
+			Attempt:   e.attempt,
+			DueAt:     e.dueAt,
+			LastErr:   e.lastErr,
+			StartedAt: e.startedAt,
+		})
+	}
+	return out
+}
