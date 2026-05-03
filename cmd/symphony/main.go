@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/chalfel/forge-flow/internal/agent"
+	"github.com/chalfel/forge-flow/internal/agent/shell"
 	agentstub "github.com/chalfel/forge-flow/internal/agent/stub"
 	"github.com/chalfel/forge-flow/internal/config"
 	"github.com/chalfel/forge-flow/internal/domain"
@@ -152,14 +154,15 @@ func runRun(args []string) int {
 			CreatedAt:  time.Now(),
 		})
 	}
-	ag := agentstub.New() // real agent runners land in phases 6 and 7
+	ag, err := buildAgent(wf, *stub, logger)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "agent: %v\n", err)
+		return 1
+	}
 	ws, err := buildWorkspace(wf, *stub, logger)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "workspace: %v\n", err)
 		return 1
-	}
-	if !*stub {
-		fmt.Fprintln(os.Stderr, "warning: real tracker is wired but agent runners are still stubs; agent.command will not actually execute yet")
 	}
 
 	s := scheduler.New(scheduler.Options{
@@ -213,6 +216,16 @@ func firstOr(xs []string, fallback string) string {
 		return xs[0]
 	}
 	return fallback
+}
+
+// buildAgent wires the configured agent runner. Both `codex` and
+// `claude_code` use the shell runner (Phase 6/7) — they only differ in
+// which AgentCommand block is read.
+func buildAgent(wf *config.Workflow, useStub bool, logger *slog.Logger) (agent.Agent, error) {
+	if useStub {
+		return agentstub.New(), nil
+	}
+	return shell.FromAgentCommand(wf.AgentCommandFor(), logger)
 }
 
 // buildWorkspace returns the FS manager for real runs and the stub for
