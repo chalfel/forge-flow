@@ -20,6 +20,9 @@ func eligible(issue domain.Issue, store *Store, terminalStates []string) Eligibi
 	if strings.TrimSpace(issue.Title) == "" {
 		return Eligibility{Reason: "missing title"}
 	}
+	if store.IsSkipped(issue.ID) {
+		return Eligibility{Reason: "decomposed by captain (skip set)"}
+	}
 	state, _ := store.State(issue.ID)
 	switch state {
 	case Claimed, Running:

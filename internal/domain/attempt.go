@@ -16,6 +16,11 @@ const (
 	StatusTimedOut               AttemptStatus = "timed_out"
 	StatusStalled                AttemptStatus = "stalled"
 	StatusCanceledByReconcile    AttemptStatus = "canceled_by_reconciliation"
+	// StatusDecomposed is returned by the captain agent when the issue was
+	// successfully expanded into child tickets. The scheduler treats this
+	// like Succeeded but additionally adds the parent to the skip set so it
+	// is not re-dispatched while Symphony is running.
+	StatusDecomposed AttemptStatus = "decomposed"
 )
 
 type RunAttempt struct {

@@ -247,6 +247,12 @@ func (s *Scheduler) handleCompletion(c completion) {
 		c.result.Status == domain.StatusTimedOut ||
 		c.result.Status == domain.StatusStalled
 
+	if !failed && c.result.Status == domain.StatusDecomposed {
+		s.store.Skip(c.issue.ID)
+		s.store.Release(c.issue.ID)
+		s.log.Info("decomposed by captain", "issue", c.issue.Identifier, "attempt", c.attempt)
+		return
+	}
 	if !failed && c.result.Status == domain.StatusSucceeded {
 		s.store.Release(c.issue.ID)
 		s.log.Info("succeeded", "issue", c.issue.Identifier, "attempt", c.attempt)

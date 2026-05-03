@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/chalfel/forge-flow/internal/agent"
+	"github.com/chalfel/forge-flow/internal/agent/router"
 	"github.com/chalfel/forge-flow/internal/agent/shell"
 	agentstub "github.com/chalfel/forge-flow/internal/agent/stub"
 	"github.com/chalfel/forge-flow/internal/captain"
@@ -173,6 +174,18 @@ func runRun(args []string) int {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "agent: %v\n", err)
 		return 1
+	}
+	// Wrap with the captain router when watch_label is configured. The
+	// captain handles tickets with the configured label; everything else
+	// falls through to the worker agent.
+	if wf.Captain.WatchLabel != "" && !*stub {
+		captainAg, err := buildCaptainRoutingAgent(wf, tr, logger)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "captain agent: %v\n", err)
+			return 1
+		}
+		ag = router.New(ag, router.Rule{Label: wf.Captain.WatchLabel, Agent: captainAg})
+		logger.Info("captain watch enabled", "label", wf.Captain.WatchLabel)
 	}
 	ws, err := buildWorkspace(wf, *stub, logger)
 	if err != nil {
@@ -401,6 +414,30 @@ type noopWriter struct{}
 
 func (noopWriter) CreateIssue(_ context.Context, _ domain.IssueDraft) (*domain.Issue, error) {
 	return nil, fmt.Errorf("dry-run: writer disabled")
+}
+
+// buildCaptainRoutingAgent wires a captain.Agent backed by the captain
+// planning runner and the workflow's tracker. Used when captain.watch_label
+// is set so the scheduler can route flagged tickets to the captain.
+func buildCaptainRoutingAgent(wf *config.Workflow, tr tracker.Tracker, logger *slog.Logger) (agent.Agent, error) {
+	planAgent, err := buildCaptainAgent(wf, logger)
+	if err != nil {
+		return nil, err
+	}
+	writer, ok := tr.(tracker.Writer)
+	if !ok {
+		return nil, fmt.Errorf("tracker %q does not implement Writer; captain watch_label needs a writable tracker", wf.Tracker.Kind)
+	}
+	cap, err := captain.New(captain.Options{
+		Config: wf,
+		Agent:  planAgent,
+		Writer: writer,
+		Logger: logger,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return captain.NewAgent(cap), nil
 }
 
 // buildAgent wires the configured agent runner. Both `codex` and

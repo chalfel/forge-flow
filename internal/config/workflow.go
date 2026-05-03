@@ -37,6 +37,11 @@ type Captain struct {
 	Command       string `yaml:"command"`
 	PromptPath    string `yaml:"prompt_path"`
 	TurnTimeoutMs int    `yaml:"turn_timeout_ms"`
+	// WatchLabel: when set, the scheduler routes any ticket carrying this
+	// label to the captain instead of the worker. The captain plans + writes
+	// child tickets and returns StatusDecomposed; the parent is added to the
+	// in-memory skip set so it is not re-dispatched.
+	WatchLabel string `yaml:"watch_label"`
 }
 
 type TrackerKind string

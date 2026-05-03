@@ -32,10 +32,33 @@ type entry struct {
 type Store struct {
 	mu      sync.Mutex
 	entries map[string]*entry
+	skip    map[string]struct{} // permanent tombstone for issues consumed by captain
 }
 
 func NewStore() *Store {
-	return &Store{entries: make(map[string]*entry)}
+	return &Store{
+		entries: make(map[string]*entry),
+		skip:    make(map[string]struct{}),
+	}
+}
+
+// Skip marks an issue ID as permanently ineligible for dispatch. Used by the
+// captain workflow: once a parent ticket is decomposed into children, we
+// don't want the scheduler to re-dispatch the parent on the next tick (the
+// label that triggered decomposition would otherwise re-claim it). The skip
+// set is in-memory only — operators must remove the watch label or
+// transition the parent state to make the change durable across restarts.
+func (s *Store) Skip(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.skip[id] = struct{}{}
+}
+
+func (s *Store) IsSkipped(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.skip[id]
+	return ok
 }
 
 // TryClaim atomically transitions an Unclaimed (or absent) issue to Claimed.
