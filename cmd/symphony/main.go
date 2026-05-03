@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -17,6 +18,7 @@ import (
 	"github.com/chalfel/forge-flow/internal/agent"
 	"github.com/chalfel/forge-flow/internal/agent/shell"
 	agentstub "github.com/chalfel/forge-flow/internal/agent/stub"
+	"github.com/chalfel/forge-flow/internal/observability"
 	"github.com/chalfel/forge-flow/internal/config"
 	"github.com/chalfel/forge-flow/internal/domain"
 	"github.com/chalfel/forge-flow/internal/scheduler"
@@ -32,12 +34,13 @@ const usage = `symphony — orchestrate coding agents from a tracker
 Usage:
   symphony validate <path/to/WORKFLOW.md>
   symphony print    <path/to/WORKFLOW.md>
-  symphony run      <path/to/WORKFLOW.md> [--stub] [--once]
+  symphony run      <path/to/WORKFLOW.md> [--stub] [--once] [--http <addr>]
   symphony version
 
 Flags for run:
-  --stub   use in-memory tracker/agent/workspace (real adapters TBD)
-  --once   run a single tick and exit (useful for smoke tests)
+  --stub          use in-memory tracker/agent/workspace stubs (dry-run)
+  --once          run a single tick and exit (useful for smoke tests)
+  --http <addr>   serve observability dashboard + JSON API at the given addr
 `
 
 func main() {
@@ -119,6 +122,7 @@ func runRun(args []string) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	stub := fs.Bool("stub", false, "use in-memory tracker/agent/workspace stubs")
 	once := fs.Bool("once", false, "run a single tick and exit")
+	httpAddr := fs.String("http", "", "address for the observability HTTP server (e.g. :8080); empty disables")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -175,6 +179,17 @@ func runRun(args []string) int {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	if *httpAddr != "" {
+		obsSrv := observability.NewServer(s)
+		go func() {
+			logger.Info("observability http listening", "addr", *httpAddr)
+			httpServer := &http.Server{Addr: *httpAddr, Handler: obsSrv.Handler(), ReadHeaderTimeout: 5 * time.Second}
+			if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Error("observability http", "err", err)
+			}
+		}()
+	}
 
 	if *once {
 		if err := s.Tick(ctx); err != nil {

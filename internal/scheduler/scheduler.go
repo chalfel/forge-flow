@@ -42,6 +42,7 @@ type Scheduler struct {
 	log       *slog.Logger
 
 	completions chan completion
+	refresh     chan struct{}
 	wg          sync.WaitGroup
 }
 
@@ -77,8 +78,22 @@ func New(opts Options) *Scheduler {
 		clock:       opts.Clock,
 		log:         opts.Logger,
 		completions: make(chan completion, 64),
+		refresh:     make(chan struct{}, 1),
 	}
 }
+
+// Refresh requests an immediate tick. Multiple concurrent calls collapse to
+// a single tick because the channel has capacity 1. Used by the
+// observability HTTP API and operator CLIs.
+func (s *Scheduler) Refresh() {
+	select {
+	case s.refresh <- struct{}{}:
+	default:
+	}
+}
+
+// Config exposes the workflow for read-only observability surfaces.
+func (s *Scheduler) Config() *config.Workflow { return s.cfg }
 
 // Run drives the scheduler until ctx is canceled. Each tick polls the tracker
 // and dispatches eligible issues; completions arrive asynchronously on the
@@ -99,6 +114,10 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			return nil
 		case c := <-s.completions:
 			s.handleCompletion(c)
+		case <-s.refresh:
+			if err := s.Tick(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				s.log.Error("refresh tick", "err", err)
+			}
 		case <-ticker.C:
 			if err := s.Tick(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				s.log.Error("tick", "err", err)
