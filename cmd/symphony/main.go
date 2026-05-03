@@ -153,7 +153,11 @@ func runRun(args []string) int {
 		})
 	}
 	ag := agentstub.New() // real agent runners land in phases 6 and 7
-	ws := workspace.NewStub()
+	ws, err := buildWorkspace(wf, *stub, logger)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "workspace: %v\n", err)
+		return 1
+	}
 	if !*stub {
 		fmt.Fprintln(os.Stderr, "warning: real tracker is wired but agent runners are still stubs; agent.command will not actually execute yet")
 	}
@@ -209,6 +213,20 @@ func firstOr(xs []string, fallback string) string {
 		return xs[0]
 	}
 	return fallback
+}
+
+// buildWorkspace returns the FS manager for real runs and the stub for
+// dry-run mode. The FS manager honours the workflow's hook config and
+// enforces path containment.
+func buildWorkspace(wf *config.Workflow, useStub bool, logger *slog.Logger) (workspace.Manager, error) {
+	if useStub {
+		return workspace.NewStub(), nil
+	}
+	return workspace.NewFS(workspace.FSOptions{
+		Root:   wf.Workspace.Root,
+		Hooks:  wf.Hooks,
+		Logger: logger,
+	})
 }
 
 // buildTracker wires the right adapter based on the workflow's tracker kind.
